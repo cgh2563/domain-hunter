@@ -246,6 +246,7 @@ def gen_html(results, complexes, run_time):
 
         rows+=f'''<tr class="{c}">
 <td>{e(r.get("_name",""))}</td>
+<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">{e(r.get("_homepage",""))}</td>
 <td class="domain">{e(r["도메인"])}</td>
 <td class="purchase">{e(r["구매가능일"])}{range_info}</td>
 <td>{basis}</td>
@@ -281,7 +282,7 @@ body{{font-family:'Pretendard',-apple-system,sans-serif;background:#0f172a;color
 .fb.ac{{background:rgba(34,211,238,.15);color:#22d3ee;border-color:rgba(34,211,238,.3)}}
 input.sr{{flex:1;min-width:150px;padding:6px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.2);color:#e2e8f0;font-size:12px;font-family:inherit;outline:none}}
 .tw{{padding:0 12px 40px;max-width:100%;overflow-x:auto}}
-table{{width:100%;border-collapse:collapse;font-size:12px;min-width:900px}}
+table{{width:100%;border-collapse:collapse;font-size:12px;min-width:1050px}}
 th{{background:#1e293b;color:#94a3b8;padding:10px 8px;text-align:left;font-weight:700;font-size:11px;position:sticky;top:0;z-index:10;cursor:pointer;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06)}}
 td{{padding:8px;border-bottom:1px solid rgba(255,255,255,.03);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}}
 tr:hover{{background:rgba(255,255,255,.03)}}
@@ -311,10 +312,10 @@ tr.now .purchase{{color:#22c55e}} tr.soon .purchase{{color:#f97316}} tr.later .p
 <input type="text" class="sr" placeholder="🔍 검색..." oninput="fs(this.value)">
 </div>
 <div class="tw"><table id="mt"><thead><tr>
-<th onclick="ss(0)">단지명 ↕</th><th onclick="ss(1)">도메인 ↕</th>
-<th onclick="ss(2)">구매가능일 ↕</th><th>계산근거</th><th>삭제시간</th>
-<th onclick="ss(5)">만료일 ↕</th><th>만료시간</th><th>상태</th>
-<th onclick="ss(8)">지역 ↕</th><th>WHOIS</th>
+<th onclick="ss(0)">단지명 ↕</th><th onclick="ss(1)">원본URL ↕</th><th onclick="ss(2)">도메인 ↕</th>
+<th onclick="ss(3)">구매가능일 ↕</th><th>계산근거</th><th>삭제시간</th>
+<th onclick="ss(6)">만료일 ↕</th><th>만료시간</th><th>상태</th>
+<th onclick="ss(9)">지역 ↕</th><th>WHOIS</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="ft">
 구매가능일: .kr=만료+31일 / .com: pendingDelete→Updated+5일, redemption→Updated+35일, 추정→만료+35~80일<br>
@@ -366,7 +367,7 @@ def main():
     print(f"\n✅ {len(results)}개 완료 ({time.time()-t0:.0f}초)")
     os.makedirs("output",exist_ok=True)
     with open("output/index.html","w",encoding="utf-8") as f: f.write(gen_html(results,cx,run_time))
-    jd=[{"name":r.get("_name",""),"domain":r["도메인"],"drop_date":r["구매가능일"],
+    jd=[{"name":r.get("_name",""),"url":r.get("_homepage",""),"domain":r["도메인"],"drop_date":r["구매가능일"],
          "drop_range":r["범위"],"basis":r["근거"],"drop_time":r["삭제시간"],
          "expiry":r["만료일"],"expiry_time":r["만료시간"],"status":r["상태"],
          "updated":r["updated"],"region":r.get("_region",""),"notice":r.get("_notice_date","")} for r in results]
