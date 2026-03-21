@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-🏠 분양 아파트 만료 도메인 헌터 v3.4
-=====================================
-구매가능일(낙장일) 정확 계산:
+🏠 분양 도메인 헌터 (GitHub Pages 웹 버전) v3.4
+GitHub Actions에서 실행 → HTML 결과 → GitHub Pages 배포
 
-  .kr / .co.kr:
-    만료 → 유예30일 → 삭제 (오전 9시)
-    구매가능일 = 만료일 + 31일
-
-  .com / .net (국제 도메인) — WHOIS 상태 기반 계산:
-    ① pendingDelete 상태 + Updated Date → Updated Date + 5일 (★ 가장 정확)
-    ② redemptionPeriod 상태 + Updated Date → Updated Date + 35일 (★ 정확)
-    ③ 상태 모름 (만료일만 있음) → 만료일 + 35~80일 (범위 추정)
-
-    삭제 시간: KST 새벽 3~5시 (미국 서부시간 11AM~2PM)
+구매가능일 계산:
+  .kr: 만료+31일
+  .com/.net: WHOIS 상태 기반
+    pendingDelete + Updated Date → +5일
+    redemptionPeriod + Updated Date → +35일
+    상태 모름 → 만료일 +35~80일
 """
 
-import socket, subprocess, json, os, sys, time, re, argparse, ssl
+import socket, subprocess, json, os, sys, time, re, argparse, ssl, hashlib, base64
 import concurrent.futures
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
@@ -27,21 +22,14 @@ ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-# ============================================================
-# 1. 청약홈 API
-# ============================================================
-
-API_ENDPOINTS = {
-    "APT": {"name": "APT 분양정보", "url": "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail"},
-}
-
+# ── 청약홈 API ──
 def fetch_applyhome(service_key, max_pages=50):
-    ep = API_ENDPOINTS["APT"]
+    url_base = "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail"
     all_data, page = [], 1
-    print(f"\n📡 [{ep['name']}] 수집 중...")
+    print(f"\n📡 수집 중...")
     while page <= max_pages:
         params = {"page": page, "perPage": 500, "serviceKey": service_key}
-        url = f"{ep['url']}?{urlencode(params, quote_via=quote)}"
+        url = f"{url_base}?{urlencode(params, quote_via=quote)}"
         try:
             req = Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
             data = json.loads(urlopen(req, timeout=30).read().decode("utf-8"))
@@ -49,474 +37,425 @@ def fetch_applyhome(service_key, max_pages=50):
             items = data["data"]; total = data.get("totalCount", 0)
             if not items: break
             all_data.extend(items)
-            print(f"   📄 페이지 {page}: {len(items)}건 (누적 {len(all_data)}/{total})")
+            print(f"   페이지 {page}: {len(items)}건 ({len(all_data)}/{total})")
             if len(all_data) >= total: break
             page += 1; time.sleep(0.3)
-        except Exception as e:
-            print(f"   ❌ {e}"); break
+        except Exception as e: print(f"   ❌ {e}"); break
     print(f"   ✅ 총 {len(all_data)}건")
     return all_data
 
-def filter_by_date(api_data, date_from=None, date_to=None):
-    if not date_from and not date_to: return api_data
-    return [i for i in api_data
-            if (i.get("RCRIT_PBLANC_DE") or "") and
-               (not date_from or (i.get("RCRIT_PBLANC_DE") or "") >= date_from) and
-               (not date_to or (i.get("RCRIT_PBLANC_DE") or "") <= date_to)]
+def filter_by_date(data, df=None, dt=None):
+    if not df and not dt: return data
+    return [i for i in data if (i.get("RCRIT_PBLANC_DE") or "") and
+            (not df or (i.get("RCRIT_PBLANC_DE") or "") >= df) and
+            (not dt or (i.get("RCRIT_PBLANC_DE") or "") <= dt)]
 
-def extract_domains(api_data):
-    complexes, seen = [], set()
-    for item in api_data:
+def extract_domains(data):
+    cx, seen = [], set()
+    for item in data:
         name = (item.get("HOUSE_NM") or "").strip()
-        homepage = (item.get("HMPG_ADRES") or "").strip()
+        hp = (item.get("HMPG_ADRES") or "").strip()
         if not name: continue
-        domains = []
-        if homepage:
-            for u in re.split(r'[,\s]+', homepage):
+        doms = []
+        if hp:
+            for u in re.split(r'[,\s]+', hp):
                 u = u.strip()
                 if not u: continue
                 if not u.startswith("http"): u = "http://" + u
                 try:
-                    dom = urlparse(u).netloc.lower().replace("www.", "")
-                    if dom and dom not in seen: domains.append(dom); seen.add(dom)
+                    d = urlparse(u).netloc.lower().replace("www.", "")
+                    if d and d not in seen: doms.append(d); seen.add(d)
                 except: pass
-        complexes.append({"name": name, "homepage": homepage, "domains": domains,
-                          "region": (item.get("SUBSCRPT_AREA_CODE_NM") or ""),
-                          "notice_date": (item.get("RCRIT_PBLANC_DE") or "")})
-    return complexes
+        cx.append({"name": name, "homepage": hp, "domains": doms,
+                   "region": item.get("SUBSCRPT_AREA_CODE_NM") or "",
+                   "notice_date": item.get("RCRIT_PBLANC_DE") or ""})
+    return cx
 
+# ── WHOIS ──
+WHOIS_SERVERS = {"kr":"whois.kr","co.kr":"whois.kr","or.kr":"whois.kr",
+    "ne.kr":"whois.kr","pe.kr":"whois.kr","go.kr":"whois.kr",
+    "com":"whois.verisign-grs.com","net":"whois.verisign-grs.com","org":"whois.pir.org"}
+SKIP = ["naver.com","daum.net","tistory.com","modoo.at","imweb.me","wixsite.com","iwinv.net","quv.kr","kro.kr"]
 
-# ============================================================
-# 2. WHOIS (상태 + Updated Date 파싱 추가)
-# ============================================================
+def to_puny(d):
+    try: return ".".join(p.encode("idna").decode("ascii") for p in d.split("."))
+    except: return d
+def get_main(d):
+    d = d.split(":")[0].lower().strip(); p = d.split(".")
+    kr = ["co","or","ne","go","pe","re","ac"]
+    if len(p)>=3 and p[-1]=="kr" and p[-2] in kr: return ".".join(p[-3:])
+    return ".".join(p[-2:]) if len(p)>=2 else d
+def get_tld(d):
+    p = d.split("."); kr = ["co","or","ne","go","pe","re","ac"]
+    if len(p)>=2 and p[-1]=="kr" and p[-2] in kr: return f"{p[-2]}.{p[-1]}"
+    return p[-1] if p else ""
 
-WHOIS_SERVERS = {
-    "kr": "whois.kr", "co.kr": "whois.kr", "or.kr": "whois.kr",
-    "ne.kr": "whois.kr", "pe.kr": "whois.kr", "go.kr": "whois.kr",
-    "com": "whois.verisign-grs.com", "net": "whois.verisign-grs.com",
-    "org": "whois.pir.org",
-}
-SKIP_DOMAINS = ["naver.com","daum.net","tistory.com","modoo.at","imweb.me",
-                "wixsite.com","iwinv.net","quv.kr","kro.kr"]
-
-def to_punycode(domain):
-    try: return ".".join(p.encode("idna").decode("ascii") for p in domain.split("."))
-    except: return domain
-
-def get_main_domain(domain):
-    domain = domain.split(":")[0].lower().strip()
-    parts = domain.split(".")
-    kr_slds = ["co","or","ne","go","pe","re","ac"]
-    if len(parts) >= 3 and parts[-1] == "kr" and parts[-2] in kr_slds:
-        return ".".join(parts[-3:])
-    if len(parts) >= 2: return ".".join(parts[-2:])
-    return domain
-
-def get_tld(domain):
-    parts = domain.split(".")
-    kr_slds = ["co","or","ne","go","pe","re","ac"]
-    if len(parts) >= 2 and parts[-1] == "kr" and parts[-2] in kr_slds:
-        return f"{parts[-2]}.{parts[-1]}"
-    return parts[-1] if parts else ""
-
-def whois_socket(domain, server, timeout=10):
+def wsock(domain, server, timeout=10):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((server, 43))
-        s.send(f"{domain}\r\n".encode())
-        result = b""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
+        s.connect((server, 43)); s.send(f"{domain}\r\n".encode())
+        r = b""
         while True:
-            data = s.recv(4096)
-            if not data: break
-            result += data
-        s.close()
-        return result.decode("utf-8", errors="ignore")
+            d = s.recv(4096)
+            if not d: break
+            r += d
+        s.close(); return r.decode("utf-8", errors="ignore")
     except: return ""
 
-def whois_command(domain, timeout=10):
-    try:
-        r = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=timeout)
-        return r.stdout
+def wcmd(domain, timeout=10):
+    try: return subprocess.run(["whois", domain], capture_output=True, text=True, timeout=timeout).stdout
     except: return ""
 
-def parse_date_str(raw):
-    """날짜 문자열을 YYYY-MM-DD로 정규화"""
+def parse_dt(raw):
     if not raw: return ""
-    raw = raw.strip()
-    m = re.match(r"(\d{4}-\d{2}-\d{2})", raw)
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", raw.strip())
     if m: return m.group(1)
-    m = re.match(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})", raw)
+    m = re.match(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})", raw.strip())
     if m: return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     return ""
-
-def parse_time_str(raw):
-    """날짜 문자열에서 시간 부분 추출"""
+def parse_tm(raw):
     if not raw: return ""
     m = re.search(r"(\d{2}:\d{2}:\d{2})", raw)
     return m.group(1) if m else ""
 
 def parse_whois(text):
-    """WHOIS 텍스트에서 만료일 + 상태 + Updated Date 추출"""
-    info = {"만료일_원본": "", "등록일": "", "상태": "", "updated_date": ""}
+    info = {"exp": "", "reg": "", "status": "", "updated": ""}
     if not text: return info
     tl = text.lower()
-
-    # 미등록
-    not_found = ["no match for","not found","no data found","is free","available",
-                  "no entries found","도메인이름이 등록되어 있지 않습니다",
-                  "above domain name is not registered","this query returned 0 objects"]
-    for nf in not_found:
-        if nf in tl:
-            info["만료일_원본"] = "🎯 미등록"; return info
-
-    # 만료일
-    for p in [r"Registry Expiry Date:\s*(.+)", r"Registrar Registration Expiration Date:\s*(.+)",
-              r"Expiration Date\s*:\s*(.+)", r"Expiry Date\s*:\s*(.+)",
-              r"등록기간만료일\s*:\s*(.+)", r"expire\s*:\s*(.+)"]:
+    nf = ["no match for","not found","no data found","is free","available",
+          "no entries found","도메인이름이 등록되어 있지 않습니다","above domain name is not registered","this query returned 0 objects"]
+    for n in nf:
+        if n in tl: info["exp"] = "🎯 미등록"; return info
+    for p in [r"Registry Expiry Date:\s*(.+)",r"Registrar Registration Expiration Date:\s*(.+)",
+              r"Expiration Date\s*:\s*(.+)",r"Expiry Date\s*:\s*(.+)",r"등록기간만료일\s*:\s*(.+)",r"expire\s*:\s*(.+)"]:
         m = re.search(p, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            if len(val) >= 8: info["만료일_원본"] = val; break
-
-    # 등록일
-    for p in [r"Creation Date:\s*(.+)", r"등록일\s*:\s*(.+)"]:
+        if m and len(m.group(1).strip())>=8: info["exp"] = m.group(1).strip(); break
+    for p in [r"Creation Date:\s*(.+)",r"등록일\s*:\s*(.+)"]:
         m = re.search(p, text, re.IGNORECASE)
-        if m: info["등록일"] = m.group(1).strip(); break
-
-    # Updated Date (낙장일 계산의 핵심!)
-    for p in [r"Updated Date:\s*(.+)", r"최근변경일\s*:\s*(.+)"]:
+        if m: info["reg"] = m.group(1).strip(); break
+    for p in [r"Updated Date:\s*(.+)",r"최근변경일\s*:\s*(.+)"]:
         m = re.search(p, text, re.IGNORECASE)
-        if m: info["updated_date"] = m.group(1).strip(); break
-
-    # Domain Status (redemptionPeriod, pendingDelete 등)
-    statuses = re.findall(r"(?:Domain )?Status:\s*(\S+)", text, re.IGNORECASE)
-    status_list = [s.lower() for s in statuses]
-
-    if any("pendingdelete" in s for s in status_list):
-        info["상태"] = "pendingDelete"
-    elif any("redemption" in s for s in status_list):
-        info["상태"] = "redemptionPeriod"
-    elif any("hold" in s or "expired" in s for s in status_list):
-        info["상태"] = "expired/hold"
-    elif any("ok" in s or "active" in s for s in status_list):
-        info["상태"] = "active"
-
+        if m: info["updated"] = m.group(1).strip(); break
+    sts = [s.lower() for s in re.findall(r"(?:Domain )?Status:\s*(\S+)", text, re.IGNORECASE)]
+    if any("pendingdelete" in s for s in sts): info["status"] = "pendingDelete"
+    elif any("redemption" in s for s in sts): info["status"] = "redemptionPeriod"
+    elif any("hold" in s or "expired" in s for s in sts): info["status"] = "expired"
+    elif any("ok" in s or "active" in s for s in sts): info["status"] = "active"
     return info
 
-
-def calc_drop_date(expiry_str, updated_str, status, tld):
-    """
-    낙장일(구매가능일) 계산 — WHOIS 상태 기반
-
-    .kr: 만료일 + 31일 (고정)
-    .com/.net (상태별):
-      pendingDelete + Updated Date → Updated Date + 5일
-      redemptionPeriod + Updated Date → Updated Date + 35일
-      상태 모름 → 만료일 + 35~80일 (범위)
-    """
-    result = {"구매가능일": "", "구매가능일_범위": "", "계산근거": "", "삭제시간": ""}
-
-    # 미등록
-    if "미등록" in (expiry_str or ""):
-        result["구매가능일"] = "즉시 등록 가능"
-        result["계산근거"] = "WHOIS 미등록"
-        return result
-
+def calc_drop(exp_str, upd_str, status, tld):
+    r = {"drop": "", "range": "", "basis": "", "time": ""}
+    if "미등록" in (exp_str or ""):
+        r["drop"] = "즉시 등록 가능"; r["basis"] = "WHOIS 미등록"; return r
+    ed = parse_dt(exp_str); ud = parse_dt(upd_str)
     is_kr = tld in ("kr","co.kr","or.kr","ne.kr","pe.kr","go.kr")
-    exp_date = parse_date_str(expiry_str)
-    upd_date = parse_date_str(updated_str)
-
     if is_kr:
-        # .kr: 만료일 + 31일 (유예30일 → 다음날 오전9시 삭제)
-        if exp_date:
+        if ed:
             try:
-                d = datetime.strptime(exp_date, "%Y-%m-%d") + timedelta(days=31)
-                result["구매가능일"] = d.strftime("%Y-%m-%d")
-                result["계산근거"] = "만료일+31일"
-                result["삭제시간"] = "오전 9:00~10:00 KST"
+                r["drop"] = (datetime.strptime(ed,"%Y-%m-%d")+timedelta(days=31)).strftime("%Y-%m-%d")
+                r["basis"] = "만료+31일"; r["time"] = "오전 9~10시 KST"
             except: pass
-        return result
-
-    # 국제 도메인 (.com/.net/.org 등)
-    result["삭제시간"] = "새벽 3:00~5:00 KST"
-
-    if status == "pendingDelete" and upd_date:
-        # ★★★ 가장 정확: Updated Date + 5일 (다음날 새벽)
+        return r
+    r["time"] = "새벽 3~5시 KST"
+    if status == "pendingDelete" and ud:
         try:
-            d = datetime.strptime(upd_date, "%Y-%m-%d") + timedelta(days=5)
-            result["구매가능일"] = d.strftime("%Y-%m-%d")
-            result["계산근거"] = f"pendingDelete→Updated({upd_date})+5일"
-            return result
+            r["drop"] = (datetime.strptime(ud,"%Y-%m-%d")+timedelta(days=5)).strftime("%Y-%m-%d")
+            r["basis"] = f"pendingDelete→Updated({ud})+5일"
         except: pass
-
-    if status == "redemptionPeriod" and upd_date:
-        # ★★☆ 정확: Updated Date + 30일(복구) + 5일(PD)
+        return r
+    if status == "redemptionPeriod" and ud:
         try:
-            d = datetime.strptime(upd_date, "%Y-%m-%d") + timedelta(days=35)
-            result["구매가능일"] = d.strftime("%Y-%m-%d")
-            result["계산근거"] = f"redemption→Updated({upd_date})+35일"
-            return result
+            r["drop"] = (datetime.strptime(ud,"%Y-%m-%d")+timedelta(days=35)).strftime("%Y-%m-%d")
+            r["basis"] = f"redemption→Updated({ud})+35일"
         except: pass
-
-    # ★☆☆ 추정: 만료일 기준 범위
-    if exp_date:
+        return r
+    if ed:
         try:
-            exp = datetime.strptime(exp_date, "%Y-%m-%d")
-            earliest = (exp + timedelta(days=35)).strftime("%Y-%m-%d")
-            typical = (exp + timedelta(days=75)).strftime("%Y-%m-%d")
-            latest = (exp + timedelta(days=80)).strftime("%Y-%m-%d")
-            result["구매가능일"] = typical
-            result["구매가능일_범위"] = f"{earliest} ~ {latest}"
-            result["계산근거"] = "만료일+35~80일 (상태 미확인, 추정)"
+            e = datetime.strptime(ed,"%Y-%m-%d")
+            ea = (e+timedelta(days=35)).strftime("%Y-%m-%d")
+            tp = (e+timedelta(days=75)).strftime("%Y-%m-%d")
+            la = (e+timedelta(days=80)).strftime("%Y-%m-%d")
+            r["drop"] = tp; r["range"] = f"{ea} ~ {la}"
+            r["basis"] = "만료+35~80일 (추정)"
         except: pass
-
-    return result
-
-
-def check_whois(domain):
-    main_dom = get_main_domain(domain)
-    result = {"만료일": "", "만료시간": "", "등록일": "", "도메인상태": "", "Updated Date": "",
-              "구매가능일": "", "구매가능일_범위": "", "계산근거": "", "삭제시간": ""}
-    if any(main_dom == s or domain.endswith("." + s) for s in SKIP_DOMAINS): return result
-
-    tld = get_tld(main_dom)
-    query_dom = to_punycode(main_dom)
-
-    # 1순위: 소켓
-    server = WHOIS_SERVERS.get(tld)
-    if server:
-        raw = whois_socket(query_dom, server)
-        if raw:
-            info = parse_whois(raw)
-            if info["만료일_원본"]:
-                result["만료일"] = parse_date_str(info["만료일_원본"])
-                result["만료시간"] = parse_time_str(info["만료일_원본"])
-                result["등록일"] = info["등록일"]
-                result["도메인상태"] = info["상태"]
-                result["Updated Date"] = parse_date_str(info["updated_date"])
-                drop = calc_drop_date(info["만료일_원본"], info["updated_date"], info["상태"], tld)
-                result.update(drop)
-                return result
-
-    # 2순위: 명령줄 whois
-    for try_dom in [query_dom, main_dom]:
-        raw = whois_command(try_dom)
-        if raw:
-            info = parse_whois(raw)
-            if info["만료일_원본"]:
-                result["만료일"] = parse_date_str(info["만료일_원본"])
-                result["만료시간"] = parse_time_str(info["만료일_원본"])
-                result["등록일"] = info["등록일"]
-                result["도메인상태"] = info["상태"]
-                result["Updated Date"] = parse_date_str(info["updated_date"])
-                drop = calc_drop_date(info["만료일_원본"], info["updated_date"], info["상태"], tld)
-                result.update(drop)
-                return result
-    return result
-
-
-# ============================================================
-# 3. 체크 + Excel
-# ============================================================
-
-def check_domain(domain):
-    r = {"도메인": domain, "만료일": "", "만료시간": "", "등록일": "", "도메인상태": "",
-         "Updated Date": "", "구매가능일": "", "구매가능일_범위": "", "계산근거": "", "삭제시간": ""}
-    w = check_whois(domain)
-    r.update(w)
-    time.sleep(0.5)
     return r
 
+def check_whois(domain):
+    md = get_main(domain)
+    res = {"만료일":"","만료시간":"","등록일":"","상태":"","updated":"",
+           "구매가능일":"","범위":"","근거":"","삭제시간":""}
+    if any(md==s or domain.endswith("."+s) for s in SKIP): return res
+    tld = get_tld(md); qd = to_puny(md)
+    sv = WHOIS_SERVERS.get(tld)
+    raw = wsock(qd, sv) if sv else ""
+    if not raw or "미등록" not in raw:
+        for td in [qd, md]:
+            raw2 = wcmd(td)
+            if raw2 and not raw: raw = raw2
+            elif raw2: raw = raw  # keep first result
+            if raw: break
+    if raw:
+        info = parse_whois(raw)
+        if info["exp"]:
+            res["만료일"] = parse_dt(info["exp"]); res["만료시간"] = parse_tm(info["exp"])
+            res["등록일"] = info["reg"]; res["상태"] = info["status"]; res["updated"] = parse_dt(info["updated"])
+            d = calc_drop(info["exp"], info["updated"], info["status"], tld)
+            res["구매가능일"]=d["drop"]; res["범위"]=d["range"]; res["근거"]=d["basis"]; res["삭제시간"]=d["time"]
+    return res
+
+def check_domain(domain):
+    r = {"도메인":domain,"만료일":"","만료시간":"","등록일":"","상태":"","updated":"",
+         "구매가능일":"","범위":"","근거":"","삭제시간":""}
+    r.update(check_whois(domain)); time.sleep(0.5); return r
+
 def try_date(s):
-    try: return datetime.strptime(s, "%Y-%m-%d")
+    try: return datetime.strptime(s,"%Y-%m-%d")
     except: return None
 
-def save_excel(results, complexes, filename):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    wb = Workbook()
-    brd = Border(left=Side(style="thin"),right=Side(style="thin"),top=Side(style="thin"),bottom=Side(style="thin"))
-    hfill = PatternFill(start_color="1F4E79",end_color="1F4E79",fill_type="solid")
-    hfont = Font(color="FFFFFF",bold=True,size=11)
+# ── HTML 생성 ──
+def gen_html(results, complexes, run_time):
     today = datetime.now()
+    na = [r for r in results if "즉시" in r.get("구매가능일","") or (try_date(r.get("구매가능일","")) and try_date(r.get("구매가능일",""))<=today)]
+    i30 = [r for r in results if r.get("구매가능일","") and "즉시" not in r.get("구매가능일","") and try_date(r.get("구매가능일","")) and 0<(try_date(r.get("구매가능일",""))-today).days<=30]
+    i90 = [r for r in results if r.get("구매가능일","") and "즉시" not in r.get("구매가능일","") and try_date(r.get("구매가능일","")) and 30<(try_date(r.get("구매가능일",""))-today).days<=90]
 
-    ws = wb.active; ws.title = "전체 결과"
-    hdrs = ["지역","단지명","공고일","원본URL","도메인","구매가능일","만료일","등록일"]
-    for c,h in enumerate(hdrs,1):
-        cl=ws.cell(row=1,column=c,value=h); cl.fill=hfill; cl.font=hfont
-        cl.alignment=Alignment(horizontal="center"); cl.border=brd
+    def rc(r):
+        p=r.get("구매가능일","")
+        if "즉시" in p: return "now"
+        pd=try_date(p)
+        if pd:
+            d=(pd-today).days
+            if d<=0: return "now"
+            if d<=30: return "soon"
+            if d<=90: return "later"
+        return ""
+    def e(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-    ncols = len(hdrs)
-    for i,item in enumerate(results,2):
-        # 구매가능일: 날짜 + 삭제시간
-        drop = item["구매가능일"]
-        if drop and "즉시" not in drop and item.get("삭제시간"):
-            drop += f" ({item['삭제시간']})"
-
-        # 만료일 + 시간
-        exp = item["만료일"]
-        if exp and item.get("만료시간"):
-            exp += f" {item['만료시간']}"
-
-        vals = [item.get("_region",""), item.get("_name",""), item.get("_notice_date",""),
-                item.get("_homepage",""), item["도메인"],
-                drop, exp, item["등록일"]]
-        for c,v in enumerate(vals,1): ws.cell(row=i,column=c,value=v).border=brd
-
-        p = item.get("구매가능일","")
-        if "즉시" in p:
-            f=PatternFill(start_color="92D050",end_color="92D050",fill_type="solid")
-            for c in range(1,ncols+1): ws.cell(row=i,column=c).fill=f
-        elif p:
-            pd = try_date(p)
-            if pd:
-                diff = (pd - today).days
-                color = None
-                if diff <= 0: color = "92D050"
-                elif diff <= 30: color = "FFC000"
-                elif diff <= 90: color = "FFFF00"
-                if color:
-                    f=PatternFill(start_color=color,end_color=color,fill_type="solid")
-                    for c in range(1,ncols+1): ws.cell(row=i,column=c).fill=f
-
-    widths = {"A":10,"B":30,"C":12,"D":45,"E":35,"F":28,"G":24,"H":24}
-    for col,w in widths.items(): ws.column_dimensions[col].width=w
-
-    # 시트2: 지금 구매 가능
-    ws2 = wb.create_sheet("⭐ 지금 구매 가능")
-    h2 = ["지역","단지명","공고일","원본URL","도메인","구매가능일","만료일","등록일"]
-    for c,h in enumerate(h2,1):
-        cl=ws2.cell(row=1,column=c,value=h)
-        cl.fill=PatternFill(start_color="00B050",end_color="00B050",fill_type="solid")
-        cl.font=Font(color="FFFFFF",bold=True)
-    row=2
+    rows=""
     for r in results:
-        p = r.get("구매가능일","")
-        avail = "즉시" in p or (p and try_date(p) and try_date(p) <= today)
-        if avail:
-            drop = p
-            if drop and "즉시" not in drop and r.get("삭제시간"): drop += f" ({r['삭제시간']})"
-            exp = r["만료일"]
-            if exp and r.get("만료시간"): exp += f" {r['만료시간']}"
-            for c,v in enumerate([r.get("_region",""),r.get("_name",""),r.get("_notice_date",""),
-                                   r.get("_homepage",""),r["도메인"],drop,exp,r["등록일"]],1):
-                ws2.cell(row=row,column=c,value=v)
-            row+=1
+        c=rc(r)
 
-    # 시트3: 30일 이내
-    ws3 = wb.create_sheet("🔥 30일 이내")
-    h3 = ["지역","단지명","공고일","원본URL","도메인","구매가능일","만료일","등록일"]
-    for c,h in enumerate(h3,1):
-        cl=ws3.cell(row=1,column=c,value=h)
-        cl.fill=PatternFill(start_color="FF6600",end_color="FF6600",fill_type="solid")
-        cl.font=Font(color="FFFFFF",bold=True)
-    row=2
-    for r in results:
-        p = r.get("구매가능일","")
-        if p and "즉시" not in p:
-            pd = try_date(p)
-            if pd and 0 < (pd-today).days <= 30:
-                drop = p
-                if r.get("삭제시간"): drop += f" ({r['삭제시간']})"
-                exp = r["만료일"]
-                if exp and r.get("만료시간"): exp += f" {r['만료시간']}"
-                for c,v in enumerate([r.get("_region",""),r.get("_name",""),r.get("_notice_date",""),
-                                       r.get("_homepage",""),r["도메인"],drop,exp,r["등록일"]],1):
-                    ws3.cell(row=row,column=c,value=v)
-                row+=1
+        # 구매가능일 + 삭제시간/범위 합치기
+        drop = e(r.get("구매가능일",""))
+        if r.get("삭제시간"):
+            drop += f' <span style="font-size:10px;color:#94a3b8">{e(r["삭제시간"])}</span>'
+        if r.get("범위"):
+            drop += f'<br><span style="font-size:10px;color:#64748b">{e(r["범위"])}</span>'
 
-    # 시트4: 요약
-    ws4 = wb.create_sheet("요약")
-    ws4.cell(row=1,column=1,value="🏠 도메인 헌터 v3.4 결과 요약").font=Font(bold=True,size=14)
-    ws4.cell(row=2,column=1,value=f"조회일시: {today.strftime('%Y-%m-%d %H:%M:%S')}")
-    ws4.cell(row=3,column=1,value=f"총 단지: {len(complexes)}개 / 도메인: {len(results)}개")
-    ws4.cell(row=5,column=1,value="📋 구매가능일(낙장일) 계산 기준:").font=Font(bold=True)
-    ws4.cell(row=6,column=1,value="  .kr: 만료일 + 31일 (유예30일 → 오전9시 삭제)")
-    ws4.cell(row=7,column=1,value="  .com/.net (pendingDelete 상태): Updated Date + 5일 → 새벽3~5시 삭제")
-    ws4.cell(row=8,column=1,value="  .com/.net (redemptionPeriod 상태): Updated Date + 35일 → 새벽3~5시 삭제")
-    ws4.cell(row=9,column=1,value="  .com/.net (상태 미확인): 만료일 + 35~80일 (범위 추정)")
-    ws4.column_dimensions["A"].width=65
-    wb.save(filename)
+        # 만료일 + 만료시간 합치기
+        exp = e(r.get("만료일",""))
+        if r.get("만료시간"):
+            exp += f' <span style="color:#64748b">{e(r["만료시간"])}</span>'
 
+        # 등록일 (시간 포함될 수 있음)
+        reg = e(r.get("등록일",""))
 
-# ============================================================
-# 4. 메인
-# ============================================================
+        rows+=f'''<tr class="{c}">
+<td>{e(r.get("_region",""))}</td>
+<td>{e(r.get("_name",""))}</td>
+<td>{e(r.get("_notice_date",""))}</td>
+<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">{e(r.get("_homepage",""))}</td>
+<td class="domain">{e(r["도메인"])}</td>
+<td class="purchase">{drop}</td>
+<td>{exp}</td>
+<td>{reg}</td>
+</tr>\n'''
 
+    return f'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>🏠 분양 도메인 헌터</title>
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Pretendard',-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
+.hd{{background:linear-gradient(135deg,#1e293b,#0f172a);padding:24px 20px;border-bottom:1px solid rgba(255,255,255,.05);text-align:center}}
+.hd h1{{font-size:22px;font-weight:800}} .hd .sub{{font-size:12px;color:#64748b;margin-top:6px}}
+.st{{display:flex;gap:12px;padding:20px;max-width:900px;margin:0 auto;flex-wrap:wrap;justify-content:center}}
+.sc{{flex:1;min-width:140px;padding:16px;border-radius:12px;text-align:center;border:1px solid rgba(255,255,255,.06)}}
+.sc.g{{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.2)}}
+.sc.o{{background:rgba(249,115,22,.1);border-color:rgba(249,115,22,.2)}}
+.sc.b{{background:rgba(59,130,246,.1);border-color:rgba(59,130,246,.2)}}
+.sc.x{{background:rgba(255,255,255,.03)}}
+.sn{{font-size:28px;font-weight:800}}
+.sc.g .sn{{color:#22c55e}}.sc.o .sn{{color:#f97316}}.sc.b .sn{{color:#3b82f6}}.sc.x .sn{{color:#94a3b8}}
+.sl{{font-size:11px;color:#94a3b8;margin-top:4px}}
+.fl{{padding:12px 20px;max-width:900px;margin:0 auto;display:flex;gap:8px;flex-wrap:wrap}}
+.fb{{padding:6px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:0;color:#94a3b8;cursor:pointer;font-size:12px;font-family:inherit;font-weight:600}}
+.fb:hover{{border-color:rgba(255,255,255,.2);color:#e2e8f0}}
+.fb.ac{{background:rgba(34,211,238,.15);color:#22d3ee;border-color:rgba(34,211,238,.3)}}
+input.sr{{flex:1;min-width:150px;padding:6px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.2);color:#e2e8f0;font-size:12px;font-family:inherit;outline:none}}
+.tw{{padding:0 12px 40px;max-width:100%;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;font-size:12px;min-width:900px}}
+th{{background:#1e293b;color:#94a3b8;padding:10px 8px;text-align:left;font-weight:700;font-size:11px;position:sticky;top:0;z-index:10;cursor:pointer;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06)}}
+td{{padding:8px;border-bottom:1px solid rgba(255,255,255,.03);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}}
+tr:hover{{background:rgba(255,255,255,.03)}}
+tr.now{{background:rgba(34,197,94,.08)}} tr.now td{{color:#86efac}}
+tr.soon{{background:rgba(249,115,22,.06)}} tr.soon td{{color:#fdba74}}
+tr.later{{background:rgba(59,130,246,.04)}}
+.domain{{font-family:'JetBrains Mono',monospace;font-size:11px}}
+.purchase{{font-weight:700}}
+tr.now .purchase{{color:#22c55e}} tr.soon .purchase{{color:#f97316}} tr.later .purchase{{color:#3b82f6}}
+.wl{{color:#64748b;text-decoration:none;padding:2px 8px;border-radius:4px;border:1px solid rgba(255,255,255,.08);font-size:10px}}
+.wl:hover{{color:#22d3ee;border-color:rgba(34,211,238,.3)}}
+.ft{{text-align:center;padding:20px;font-size:11px;color:#475569;border-top:1px solid rgba(255,255,255,.03)}}
+</style></head><body>
+<div class="hd"><h1>🏠 분양 아파트 만료 도메인 헌터</h1>
+<div class="sub">업데이트: {run_time} KST · WHOIS 상태+Updated Date 기반 낙장일 계산 · 매일 자동 갱신</div></div>
+<div class="st">
+<div class="sc g"><div class="sn">{len(na)}</div><div class="sl">⭐ 지금 구매 가능</div></div>
+<div class="sc o"><div class="sn">{len(i30)}</div><div class="sl">🔥 30일 이내</div></div>
+<div class="sc b"><div class="sn">{len(i90)}</div><div class="sl">📅 90일 이내</div></div>
+<div class="sc x"><div class="sn">{len(results)}</div><div class="sl">전체 도메인</div></div>
+</div>
+<div class="fl">
+<button class="fb ac" onclick="ff('all')">전체</button>
+<button class="fb" onclick="ff('now')">⭐ 지금 가능</button>
+<button class="fb" onclick="ff('soon')">🔥 30일 이내</button>
+<button class="fb" onclick="ff('later')">📅 90일 이내</button>
+<input type="text" class="sr" placeholder="🔍 검색..." oninput="fs(this.value)">
+</div>
+<div class="tw"><table id="mt"><thead><tr>
+<th onclick="ss(0)">지역 ↕</th><th onclick="ss(1)">단지명 ↕</th><th onclick="ss(2)">공고일 ↕</th>
+<th onclick="ss(3)">원본URL ↕</th><th onclick="ss(4)">도메인 ↕</th>
+<th onclick="ss(5)">구매가능일 ↕</th><th onclick="ss(6)">만료일 ↕</th><th onclick="ss(7)">등록일 ↕</th>
+</tr></thead><tbody>{rows}</tbody></table></div>
+<div class="ft">
+구매가능일: .kr=만료+31일 / .com: pendingDelete→Updated+5일, redemption→Updated+35일, 추정→만료+35~80일<br>
+{len(complexes)}개 단지 · {len(results)}개 도메인
+</div>
+<script>
+function ff(c){{document.querySelectorAll('.fb').forEach(b=>b.classList.remove('ac'));event.target.classList.add('ac');
+document.querySelectorAll('#mt tbody tr').forEach(t=>{{t.style.display=c==='all'?'':t.classList.contains(c)?'':'none'}})}}
+function fs(q){{q=q.toLowerCase();document.querySelectorAll('#mt tbody tr').forEach(t=>{{t.style.display=t.textContent.toLowerCase().includes(q)?'':'none'}})}}
+let sd={{}};function ss(c){{const tb=document.querySelector('#mt tbody'),rs=Array.from(tb.querySelectorAll('tr'));sd[c]=!sd[c];
+rs.sort((a,b)=>{{const av=a.cells[c]?.textContent||'',bv=b.cells[c]?.textContent||'';return sd[c]?av.localeCompare(bv,'ko'):-av.localeCompare(bv,'ko')}});
+rs.forEach(r=>tb.appendChild(r))}}
+</script></body></html>'''
+
+PASSWORD = "0621"
+
+def encrypt_content(content, password):
+    """비밀번호로 콘텐츠를 암호화 (salt + XOR with SHA-256 key)
+    소스코드에 비밀번호가 저장되지 않음 — 암호화된 blob만 존재"""
+    salt = os.urandom(16)
+    key = hashlib.sha256(salt + password.encode()).digest()  # 32 bytes
+    content_bytes = content.encode('utf-8')
+    key_stream = (key * (len(content_bytes) // 32 + 1))[:len(content_bytes)]
+    encrypted = bytes(a ^ b for a, b in zip(content_bytes, key_stream))
+    return base64.b64encode(salt + encrypted).decode('ascii')
+
+def wrap_with_password(encrypted_blob, run_time):
+    """암호화된 콘텐츠를 비밀번호 입력 화면으로 감싸기"""
+    return f'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>🏠 분양 도메인 헌터</title>
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Pretendard',-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+#lock{{text-align:center;padding:40px;animation:fadeIn .5s}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}}
+#lock h1{{font-size:48px;margin-bottom:12px}}
+#lock h2{{font-size:18px;font-weight:700;margin-bottom:6px}}
+#lock .sub{{font-size:12px;color:#64748b;margin-bottom:32px}}
+#lock input{{
+  width:200px;padding:14px 20px;border-radius:12px;border:2px solid rgba(255,255,255,.1);
+  background:rgba(0,0,0,.3);color:#f1f5f9;font-size:24px;font-weight:700;text-align:center;
+  letter-spacing:8px;font-family:'JetBrains Mono',monospace;outline:none;
+}}
+#lock input:focus{{border-color:rgba(34,211,238,.4)}}
+#lock input::placeholder{{color:#334155;letter-spacing:4px;font-size:16px}}
+#lock button{{
+  display:block;width:200px;margin:16px auto 0;padding:12px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,#0891b2,#0e7490);color:#fff;font-size:14px;font-weight:700;
+  cursor:pointer;font-family:inherit;
+}}
+#lock button:hover{{filter:brightness(1.1)}}
+#lock .err{{color:#ef4444;font-size:12px;margin-top:12px;min-height:18px}}
+#lock .info{{color:#475569;font-size:11px;margin-top:24px}}
+</style></head><body>
+<div id="lock">
+  <h1>🔒</h1>
+  <h2>분양 도메인 헌터</h2>
+  <div class="sub">업데이트: {run_time} KST</div>
+  <input type="password" id="pw" placeholder="••••" maxlength="20"
+    onkeydown="if(event.key==='Enter')unlock()">
+  <button onclick="unlock()">잠금 해제</button>
+  <div class="err" id="err"></div>
+  <div class="info">비밀번호를 입력하세요</div>
+</div>
+<script>
+const E="{encrypted_blob}";
+async function unlock(){{
+  const pw=document.getElementById('pw').value;
+  if(!pw)return;
+  try{{
+    const raw=Uint8Array.from(atob(E),c=>c.charCodeAt(0));
+    const salt=raw.slice(0,16);
+    const enc=raw.slice(16);
+    const combined=new Uint8Array([...salt,...new TextEncoder().encode(pw)]);
+    const keyBuf=await crypto.subtle.digest('SHA-256',combined);
+    const key=new Uint8Array(keyBuf);
+    const dec=new Uint8Array(enc.length);
+    for(let i=0;i<enc.length;i++)dec[i]=enc[i]^key[i%32];
+    const html=new TextDecoder().decode(dec);
+    if(html.includes('<!DOCTYPE')||html.includes('<html')){{
+      document.open();document.write(html);document.close();
+    }}else{{
+      document.getElementById('err').textContent='비밀번호가 틀립니다';
+      document.getElementById('pw').value='';
+      document.getElementById('pw').focus();
+    }}
+  }}catch(e){{
+    document.getElementById('err').textContent='비밀번호가 틀립니다';
+    document.getElementById('pw').value='';
+    document.getElementById('pw').focus();
+  }}
+}}
+document.getElementById('pw').focus();
+</script></body></html>'''
+
+# ── 메인 ──
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--key", type=str, required=True)
-    parser.add_argument("--date-from", type=str, default="")
-    parser.add_argument("--date-to", type=str, default="")
-    parser.add_argument("--output", type=str, default="domain_hunter_results")
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--date-from", default="")
+    parser.add_argument("--date-to", default="")
     parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
 
-    print("""
-╔══════════════════════════════════════════════════════════════════╗
-║   🏠 분양 아파트 만료 도메인 헌터 v3.4                           ║
-║   ────────────────────────────────────────────────────────     ║
-║   .kr: 만료+31일 / .com: WHOIS상태+Updated Date 기반 정밀 계산  ║
-║   pendingDelete → +5일 / redemption → +35일 / 추정 → +35~80일  ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
-
+    t0 = time.time()
     all_data = fetch_applyhome(args.key)
     if args.date_from or args.date_to:
         all_data = filter_by_date(all_data, args.date_from, args.date_to)
-
-    complexes = extract_domains(all_data)
+    cx = extract_domains(all_data)
     to_check = []
-    for c in complexes:
-        for d in c.get("domains", []):
-            to_check.append({"domain": d, "name": c["name"], "homepage": c.get("homepage",""),
-                             "region": c.get("region",""), "notice_date": c.get("notice_date","")})
-
-    print(f"\n🔍 {len(to_check)}개 도메인 WHOIS 체크 중...\n")
-
+    for c in cx:
+        for d in c["domains"]:
+            to_check.append({"domain":d,"name":c["name"],"homepage":c["homepage"],
+                             "region":c["region"],"notice_date":c["notice_date"]})
+    print(f"\n🔍 {len(to_check)}개 WHOIS 체크 중...\n")
     results, checked = [], 0
-    total = len(to_check); t0 = time.time()
-
+    total = len(to_check)
     def proc(item):
         r = check_domain(item["domain"])
-        r["_name"]=item["name"]; r["_homepage"]=item["homepage"]
-        r["_region"]=item["region"]; r["_notice_date"]=item["notice_date"]
+        r["_name"]=item["name"];r["_homepage"]=item["homepage"]
+        r["_region"]=item["region"];r["_notice_date"]=item["notice_date"]
         return r
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        fmap = {ex.submit(proc, i): i for i in to_check}
+        fmap={ex.submit(proc,i):i for i in to_check}
         for f in concurrent.futures.as_completed(fmap):
-            checked+=1; r=f.result(); results.append(r)
-            p=r.get("구매가능일",""); s=r.get("도메인상태","")
-            w = ""
-            if "즉시" in p: w=f" | ⭐ 즉시등록가능"
-            elif p: w=f" | 구매: {p}"
-            if s: w += f" [{s}]"
-            if checked % 20 == 0 or "즉시" in p or s in ("pendingDelete","redemptionPeriod"):
-                print(f"  [{checked:4d}/{total}] {r['도메인'][:30]:30s}{w}")
+            checked+=1;r=f.result();results.append(r)
+            if checked%50==0: print(f"  [{checked}/{total}]")
+    results.sort(key=lambda r:r.get("구매가능일","") if r.get("구매가능일","") and "즉시" not in r.get("구매가능일","") else ("0000" if "즉시" in r.get("구매가능일","") else "9999"))
+    run_time=datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"\n✅ {len(results)}개 완료 ({time.time()-t0:.0f}초)")
+    os.makedirs("output",exist_ok=True)
+    content_html = gen_html(results,cx,run_time)
+    encrypted = encrypt_content(content_html, PASSWORD)
+    protected_html = wrap_with_password(encrypted, run_time)
+    with open("output/index.html","w",encoding="utf-8") as f: f.write(protected_html)
+    print(f"💾 output/index.html 생성 (비밀번호 보호 적용)")
+    print(f"🔒 비밀번호 없이는 내용을 볼 수 없습니다")
 
-    results.sort(key=lambda r: r.get("구매가능일","") if r.get("구매가능일","") and "즉시" not in r.get("구매가능일","") else ("0000" if "즉시" in r.get("구매가능일","") else "9999"))
-
-    print(f"\n⏱️  {time.time()-t0:.0f}초 / {len(results)}개 완료")
-
-    save_excel(results, complexes, f"{args.output}.xlsx")
-    print(f"💾 저장: {args.output}.xlsx")
-
-    now_avail = [r for r in results if "즉시" in r.get("구매가능일","") or
-                 (try_date(r.get("구매가능일","")) and try_date(r.get("구매가능일","")) <= datetime.now())]
-    pending = [r for r in results if r.get("도메인상태") in ("pendingDelete","redemptionPeriod")]
-
-    if now_avail:
-        print(f"\n⭐ 지금 구매 가능: {len(now_avail)}개")
-        for r in now_avail[:20]:
-            print(f"  ⭐ {r['도메인']:35s} | {r.get('_name','')[:20]} | {r['계산근거']}")
-    if pending:
-        print(f"\n🚨 삭제 임박 (pendingDelete/redemption): {len(pending)}개")
-        for r in pending[:20]:
-            print(f"  🚨 {r['도메인']:35s} | {r['도메인상태']} | 구매: {r['구매가능일']}")
-
-    print("\n✅ 완료!")
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
