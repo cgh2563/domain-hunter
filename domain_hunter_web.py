@@ -11,7 +11,7 @@ GitHub Actions에서 실행 → HTML 결과 → GitHub Pages 배포
     상태 모름 → 만료일 +35~80일
 """
 
-import socket, subprocess, json, os, sys, time, re, argparse, ssl
+import socket, subprocess, json, os, sys, time, re, argparse, ssl, hashlib, base64
 import concurrent.futures
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
@@ -330,6 +330,89 @@ rs.sort((a,b)=>{{const av=a.cells[c]?.textContent||'',bv=b.cells[c]?.textContent
 rs.forEach(r=>tb.appendChild(r))}}
 </script></body></html>'''
 
+PASSWORD = "0621"
+
+def encrypt_content(content, password):
+    """비밀번호로 콘텐츠를 암호화 (salt + XOR with SHA-256 key)
+    소스코드에 비밀번호가 저장되지 않음 — 암호화된 blob만 존재"""
+    salt = os.urandom(16)
+    key = hashlib.sha256(salt + password.encode()).digest()  # 32 bytes
+    content_bytes = content.encode('utf-8')
+    key_stream = (key * (len(content_bytes) // 32 + 1))[:len(content_bytes)]
+    encrypted = bytes(a ^ b for a, b in zip(content_bytes, key_stream))
+    return base64.b64encode(salt + encrypted).decode('ascii')
+
+def wrap_with_password(encrypted_blob, run_time):
+    """암호화된 콘텐츠를 비밀번호 입력 화면으로 감싸기"""
+    return f'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>🏠 분양 도메인 헌터</title>
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Pretendard',-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+#lock{{text-align:center;padding:40px;animation:fadeIn .5s}}
+@keyframes fadeIn{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}}
+#lock h1{{font-size:48px;margin-bottom:12px}}
+#lock h2{{font-size:18px;font-weight:700;margin-bottom:6px}}
+#lock .sub{{font-size:12px;color:#64748b;margin-bottom:32px}}
+#lock input{{
+  width:200px;padding:14px 20px;border-radius:12px;border:2px solid rgba(255,255,255,.1);
+  background:rgba(0,0,0,.3);color:#f1f5f9;font-size:24px;font-weight:700;text-align:center;
+  letter-spacing:8px;font-family:'JetBrains Mono',monospace;outline:none;
+}}
+#lock input:focus{{border-color:rgba(34,211,238,.4)}}
+#lock input::placeholder{{color:#334155;letter-spacing:4px;font-size:16px}}
+#lock button{{
+  display:block;width:200px;margin:16px auto 0;padding:12px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,#0891b2,#0e7490);color:#fff;font-size:14px;font-weight:700;
+  cursor:pointer;font-family:inherit;
+}}
+#lock button:hover{{filter:brightness(1.1)}}
+#lock .err{{color:#ef4444;font-size:12px;margin-top:12px;min-height:18px}}
+#lock .info{{color:#475569;font-size:11px;margin-top:24px}}
+</style></head><body>
+<div id="lock">
+  <h1>🔒</h1>
+  <h2>분양 도메인 헌터</h2>
+  <div class="sub">업데이트: {run_time} KST</div>
+  <input type="password" id="pw" placeholder="••••" maxlength="20"
+    onkeydown="if(event.key==='Enter')unlock()">
+  <button onclick="unlock()">잠금 해제</button>
+  <div class="err" id="err"></div>
+  <div class="info">비밀번호를 입력하세요</div>
+</div>
+<script>
+const E="{encrypted_blob}";
+async function unlock(){{
+  const pw=document.getElementById('pw').value;
+  if(!pw)return;
+  try{{
+    const raw=Uint8Array.from(atob(E),c=>c.charCodeAt(0));
+    const salt=raw.slice(0,16);
+    const enc=raw.slice(16);
+    const combined=new Uint8Array([...salt,...new TextEncoder().encode(pw)]);
+    const keyBuf=await crypto.subtle.digest('SHA-256',combined);
+    const key=new Uint8Array(keyBuf);
+    const dec=new Uint8Array(enc.length);
+    for(let i=0;i<enc.length;i++)dec[i]=enc[i]^key[i%32];
+    const html=new TextDecoder().decode(dec);
+    if(html.includes('<!DOCTYPE')||html.includes('<html')){{
+      document.open();document.write(html);document.close();
+    }}else{{
+      document.getElementById('err').textContent='비밀번호가 틀립니다';
+      document.getElementById('pw').value='';
+      document.getElementById('pw').focus();
+    }}
+  }}catch(e){{
+    document.getElementById('err').textContent='비밀번호가 틀립니다';
+    document.getElementById('pw').value='';
+    document.getElementById('pw').focus();
+  }}
+}}
+document.getElementById('pw').focus();
+</script></body></html>'''
+
 # ── 메인 ──
 def main():
     parser = argparse.ArgumentParser()
@@ -366,13 +449,11 @@ def main():
     run_time=datetime.now().strftime("%Y-%m-%d %H:%M")
     print(f"\n✅ {len(results)}개 완료 ({time.time()-t0:.0f}초)")
     os.makedirs("output",exist_ok=True)
-    with open("output/index.html","w",encoding="utf-8") as f: f.write(gen_html(results,cx,run_time))
-    jd=[{"name":r.get("_name",""),"url":r.get("_homepage",""),"domain":r["도메인"],"drop_date":r["구매가능일"],
-         "drop_range":r["범위"],"basis":r["근거"],"drop_time":r["삭제시간"],
-         "expiry":r["만료일"],"expiry_time":r["만료시간"],"status":r["상태"],
-         "updated":r["updated"],"region":r.get("_region",""),"notice":r.get("_notice_date","")} for r in results]
-    with open("output/data.json","w",encoding="utf-8") as f:
-        json.dump({"updated":run_time,"count":len(jd),"domains":jd},f,ensure_ascii=False,indent=2)
-    print(f"💾 output/index.html + data.json 생성")
+    content_html = gen_html(results,cx,run_time)
+    encrypted = encrypt_content(content_html, PASSWORD)
+    protected_html = wrap_with_password(encrypted, run_time)
+    with open("output/index.html","w",encoding="utf-8") as f: f.write(protected_html)
+    print(f"💾 output/index.html 생성 (비밀번호 보호 적용)")
+    print(f"🔒 비밀번호 없이는 내용을 볼 수 없습니다")
 
 if __name__ == "__main__": main()
