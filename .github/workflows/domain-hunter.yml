@@ -2,8 +2,8 @@ name: 🏠 도메인 헌터 자동 실행
 
 on:
   schedule:
-    # 매일 한국시간 오전 7시 실행 (UTC 22:00)
-    - cron: '0 22 * * *'
+    # 매일 한국시간 오전 10시 실행 (UTC 22:00)
+    - cron: '0 1 * * *'
   workflow_dispatch:
     # 수동 실행도 가능
     inputs:
