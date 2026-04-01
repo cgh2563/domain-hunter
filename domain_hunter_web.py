@@ -253,12 +253,12 @@ def gen_html(results, complexes, run_time):
         rows+=f'''<tr class="{c}">
 <td>{e(r.get("_region",""))}</td>
 <td>{e(r.get("_name",""))}</td>
-<td>{e(r.get("_notice_date",""))}</td>
 <td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">{e(r.get("_homepage",""))}</td>
 <td class="domain">{e(r["도메인"])}</td>
 <td class="purchase">{drop}</td>
 <td>{exp}</td>
 <td>{reg}</td>
+<td>{e(r.get("_notice_date",""))}</td>
 </tr>\n'''
 
     return f'''<!DOCTYPE html>
@@ -315,9 +315,9 @@ tr.now .purchase{{color:#22c55e}} tr.soon .purchase{{color:#f97316}} tr.later .p
 <input type="text" class="sr" placeholder="🔍 검색..." oninput="fs(this.value)">
 </div>
 <div class="tw"><table id="mt"><thead><tr>
-<th onclick="ss(0)">지역 ↕</th><th onclick="ss(1)">단지명 ↕</th><th onclick="ss(2)">공고일 ↕</th>
-<th onclick="ss(3)">원본URL ↕</th><th onclick="ss(4)">도메인 ↕</th>
-<th onclick="ss(5)">구매가능일 ↕</th><th onclick="ss(6)">만료일 ↕</th><th onclick="ss(7)">등록일 ↕</th>
+<th onclick="ss(0)">지역 ↕</th><th onclick="ss(1)">단지명 ↕</th>
+<th onclick="ss(2)">원본URL ↕</th><th onclick="ss(3)">도메인 ↕</th>
+<th onclick="ss(4)">구매가능일 ↕</th><th onclick="ss(5)">만료일 ↕</th><th onclick="ss(6)">등록일 ↕</th><th onclick="ss(7)">공고일 ↕</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="ft">
 구매가능일: .kr=만료+31일 / .com: pendingDelete→Updated+5일, redemption→Updated+35일, 추정→만료+35~80일<br>
